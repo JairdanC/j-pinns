@@ -1,9 +1,10 @@
 import jax
 import jax.numpy as jnp
+from typing import Callable
 
 def build_n_soliton(k_vec: jax.Array,
                     d_vec: jax.Array
-                    ) -> tuple[function]:
+                    ) -> tuple[Callable]:
     """
     Using Karnav's work on the n_soliton (see PyTorch sister lib) and Dorey, P. E. (2026)
     In Solitons 2025-26 (Chapter 7) Durham University. A general builder for the functions f, f_x, f_xx used 
