@@ -1,82 +1,82 @@
 from typing import Callable
-from jax import vmap, grad
+import jax
+from jax import vmap, grad, value_and_grad
+from jax.tree_util import Partial
 import jax.numpy as jnp
+from jaxtyping import Float
+import equinox as eqx
+import optax.losses as optl
 
-from .methods import build_n_soliton
 
-def gen_loss_fn(soliton_params: dict, domain_numeric, expect_cons: list[int] = None) -> Callable:
+from .kdv_methods import build_n_soliton
+from ..types import KDV_DOMAIN
+
+def gen_loss_fn(soliton_params: dict[str, jax.Array],
+                domain_init,
+                ) -> Callable:
     """
     Generates a JIT-compatible PINN loss function for the KdV eq.
     - Will have to change this to add a batched version when domain size increases
     - Need to implement device state management (GPU)
     - Replace separate model and grad(model) calls with value_and_grad to compute u and u_x simultaneously and halve compute time.
     - Ensure jnp.trapezoid axes are explicitly mapped when integrating conserved quantities across multiple time slices to prevent cross-slice bugs.
-    - Extract hardcoded coefficients (e.g., KdV's 6) into soliton_params to support general non-linear dispersive wave sweeps.
     """
     #Calculate predicted info such that they are included in the closure of the func
-
-    if expect_cons is None:
-        expect_cons = [0]
     
     #Precompute exact arrays, these are added to the closure as constants
     u = build_n_soliton(soliton_params['k_vec'], d_vec=soliton_params['d_vec'])[0]
-
-    u_ic = vmap(u)(domain_numeric.x_ic, domain_numeric.t_ic)
-    u_bc = jnp.zeros_like(domain_numeric.x_bc) #BC of 0
+    u_ic = vmap(u)(domain_init.x_ic, domain_init.t_ic)
 
     #Initialize to 0.0 to avoid unbound variable errors in the closure
-    momentum_quantity, energy_quantity, hamilt_quantity = 0.0, 0.0, 0.0
+    momentum_quantity, energy_quantity, hamilt_quantity = jnp.array(0.0), jnp.array(0.0), jnp.array(0.0)
 
-    if 1 in expect_cons:
-        momentum_quantity = jnp.trapezoid(u_ic, domain_numeric.x_ic, axis=0)
-    if 2 in expect_cons:
-        energy_quantity = jnp.trapezoid(u_ic**2, domain_numeric.x_ic, axis=0)
-    if 3 in expect_cons:
-        u_x_ic = vmap(grad(u, argnums=0))(domain_numeric.x_ic, domain_numeric.t_ic)
-        hamilt_quantity = jnp.trapezoid(u_ic**3 - 0.5*(u_x_ic**2), domain_numeric.x_ic, axis=0)
+    if domain_init.t_momentum is not None:
+        momentum_quantity = jnp.trapezoid(u_ic, domain_init.x_ic, axis=0)
+    if domain_init.t_energy is not None:
+        energy_quantity = jnp.trapezoid(u_ic**2, domain_init.x_ic, axis=0)
+    if domain_init.t_hamilt is not None:
+        u_x_ic = vmap(grad(u, argnums=0))(domain_init.x_ic, domain_init.t_ic)
+        hamilt_quantity = jnp.trapezoid(u_ic**3 - 0.5*(u_x_ic**2), domain_init.x_ic, axis=0)
 
     #Closure func
-    def loss_fn(model, weights, domain):
+    def loss_fn(model: eqx.Module, weights: Float[jax.Array, "6"], domain: KDV_DOMAIN):
         #IC
         u_pred_ic =  vmap(model)(domain.x_ic, domain.t_ic)
-        loss_ic = jnp.mean((u_pred_ic - u_ic)**2) #L2 / MSE Loss
+        loss_ic = jnp.mean(optl.l2_loss(u_pred_ic, u_ic)) 
 
         #BC
         u_pred_bc = vmap(model)(domain.x_bc, domain.t_bc)
-        loss_bc = jnp.mean((u_pred_bc - u_bc)**2) #L2 / MSE Loss
+        loss_bc = jnp.mean(optl.l2_loss(u_pred_bc, jnp.zeros_like(u_pred_bc))) #Dirichlet boundary condition 
 
         #PDE
-        
-        u_pred_pde = vmap(model)(domain.x_coll, domain.t_coll)
-        u_t_pde = vmap(grad(model, argnums=1))(domain.x_coll, domain.t_coll) 
-        u_x_pde = vmap(grad(model, argnums=0))(domain.x_coll, domain.t_coll)
+        u_pred_pde, grads_pde = vmap(value_and_grad(model, argnums=(0,1)))(domain.x_coll, domain.t_coll)
+        u_x_pde, u_t_pde = grads_pde
         u_xxx_pde = vmap(grad(grad(grad(model, argnums=0), argnums=0), argnums=0))(domain.x_coll, domain.t_coll)
 
         resid = u_t_pde + 6*u_pred_pde*u_x_pde + u_xxx_pde
-        loss_pde = jnp.mean((resid)**2) #L2 / MSE Loss
+        loss_pde = jnp.mean(optl.l2_loss(resid, jnp.zeros_like(resid)))
         
         #CONS - using the momentum of the system
-        if 1 in expect_cons:
+        if domain.t_momentum is not None:
             u_pred_momentum = vmap(model)(domain.x_ic, domain.t_momentum)
             momentum_pred = jnp.trapezoid(u_pred_momentum, domain.x_ic, axis=0)
-            loss_momentum = jnp.mean((momentum_pred - momentum_quantity)**2)
+            loss_momentum = optl.l2_loss(momentum_pred, momentum_quantity)
         else: 
             loss_momentum = jnp.array(0.0)
 
         #CONS - using the energy of the system
-        if 2 in expect_cons:
+        if domain.t_energy is not None:
             u_pred_energy = vmap(model)(domain.x_ic, domain.t_energy)
             energy_pred = jnp.trapezoid(u_pred_energy**2, domain.x_ic, axis=0)
-            loss_energy = jnp.mean((energy_pred - energy_quantity)**2)
+            loss_energy = optl.l2_loss(energy_pred, energy_quantity)
         else:
             loss_energy = jnp.array(0.0)
 
         #CONS - using the hamiltonian of the system
-        if 3 in expect_cons:
-            u_pred_hamilt = vmap(model)(domain.x_ic, domain.t_hamilt)
-            u_x_hamilt = vmap(grad(model, argnums=0))(domain.x_ic, domain.t_hamilt)
+        if domain.t_hamilt is not None:
+            u_pred_hamilt, u_x_hamilt = vmap(value_and_grad(model, argnums=0))(domain.x_ic, domain.t_hamilt)
             hamilt_pred = jnp.trapezoid(u_pred_hamilt**3 - 0.5*(u_x_hamilt**2), domain.x_ic, axis=0)
-            loss_hamilt = jnp.mean((hamilt_pred - hamilt_quantity)**2)
+            loss_hamilt = optl.l2_loss(hamilt_pred, hamilt_quantity)
         else:
             loss_hamilt = jnp.array(0.0)
 
